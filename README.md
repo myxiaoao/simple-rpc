@@ -6,6 +6,7 @@
 - [x] 支持并发与异步的客户端
 - [x] 服务注册(service register)
 - [x] 超时处理(timeout)
+- [x] 支持 HTTP 协议
 
 ## License
 
