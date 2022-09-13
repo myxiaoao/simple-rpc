@@ -58,7 +58,7 @@ func TestClient_Call(t *testing.T) {
 	t.Run("client timeout", func(t *testing.T) {
 		client, _ := Dial("tcp", addr)
 		ctx, cancelFunc := context.WithTimeout(context.Background(), time.Second)
-		cancelFunc()
+		defer cancelFunc()
 		var reply int
 		err := client.Call(ctx, "Bar.Timeout", 1, &reply)
 		_assert(err != nil && strings.Contains(err.Error(), ctx.Err().Error()), "expect a timeout error")
