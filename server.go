@@ -2,12 +2,13 @@ package simple_rpc
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"simple_rpc/codec"
+	"strings"
 	"sync"
 )
 
@@ -36,7 +37,13 @@ var DefaultOption = &Option{
 }
 
 // Server represents an RPC Server.
-type Server struct{}
+// 通过反射结构体已经映射为服务，但请求的处理过程还没有完成。从接收到请求到回复还差以下几个步骤：
+// 第一步，根据入参类型，将请求的 body 反序列化；
+// 第二步，调用 service.call，完成方法调用；
+// 第三步，将 reply 序列化为字节流，构造响应报文，返回。
+type Server struct {
+	serviceMap sync.Map
+}
 
 // NewServer returns a new Server.
 func NewServer() *Server {
@@ -102,10 +109,36 @@ func (server *Server) serveCodec(cc codec.Codec) {
 	_ = cc.Close()
 }
 
+// findService 方法，即通过 ServiceMethod 从 serviceMap 中找到对应的 service
+// findService 的实现看似比较繁琐，但是逻辑还是非常清晰的。因为 ServiceMethod 的构成是 “Service.Method”，因此先将其分割成 2 部分，
+// 第一部分是 Service 的名称，第二部分即方法名。
+// 先在 serviceMap 中找到对应的 service 实例，再从 service 实例的 method 中，找到对应的 methodType。
+func (server *Server) findService(serviceMethod string) (svc *service, mType *methodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	sci, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service " + serviceName)
+		return
+	}
+	svc = sci.(*service)
+	mType = svc.method[methodName]
+	if mType == nil {
+		err = errors.New("rpc server: can't find method " + methodName)
+	}
+	return
+}
+
 // request stores all information of a call
 type request struct {
-	h           *codec.Header // header of request
-	argv, reply reflect.Value // argv and reply of request
+	h            *codec.Header // header of request
+	argV, replyV reflect.Value // argv and reply of request
+	mType        *methodType
+	svc          *service
 }
 
 func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
@@ -119,17 +152,30 @@ func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	return &h, nil
 }
 
+// readRequest 方法中最重要的部分，即通过 newArgV() 和 newReplyV() 两个方法创建出两个入参实例，
+// 然后通过 cc.ReadBody() 将请求报文反序列化为第一个入参 argV，
+// 在这里同样需要注意 argV 可能是值类型，也可能是指针类型，所以处理方式有点差异。
 func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	h, err := server.readRequestHeader(cc)
 	if err != nil {
 		return nil, err
 	}
 	req := &request{h: h}
-	// TODO: now we don't know the type of request argv
-	// day 1, just suppose it's string
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server: read argv err:", err)
+	req.svc, req.mType, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	req.argV = req.mType.newArgV()
+	req.replyV = req.mType.newReplyV()
+
+	// make sure that argVi is a pointer, ReadBody need a pointer as parameter
+	argVI := req.argV.Interface()
+	if req.argV.Type().Kind() != reflect.Ptr {
+		argVI = req.argV.Addr().Interface()
+	}
+	if err = cc.ReadBody(argVI); err != nil {
+		log.Println("rpc server: read body err:", err)
+		return req, err
 	}
 	return req, nil
 }
@@ -142,13 +188,16 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 	}
 }
 
+// handleRequest 的实现非常简单，通过 req.svc.call 完成方法调用，将 replyV 传递给 sendResponse 完成序列化即可。
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
-	// TODO, should call registered rpc methods to get the right reply
-	// day 1, just print argv and send a hello message
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.reply = reflect.ValueOf(fmt.Sprintf("simple rpc resp %d", req.h.Seq))
-	server.sendResponse(cc, req.h, req.reply.Interface(), sending)
+	err := req.svc.call(req.mType, req.argV, req.replyV)
+	if err != nil {
+		req.h.Error = err.Error()
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+		return
+	}
+	server.sendResponse(cc, req.h, req.replyV.Interface(), sending)
 }
 
 // Accept accepts connections on the listener and serves requests
@@ -168,3 +217,20 @@ func (server *Server) Accept(lis net.Listener) {
 // Accept accepts connections on the listener and serves requests
 // for each incoming connection.
 func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
+
+// Register publishes in the server the set of methods of the
+// receiver value that satisfy the following conditions:
+//   - exported method of exported type
+//   - two arguments, both of exported type
+//   - the second argument is a pointer
+//   - one return value, of type error
+func (server *Server) Register(rcv interface{}) error {
+	s := newService(rcv)
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc: service already defined: " + s.name)
+	}
+	return nil
+}
+
+// Register publishes the receiver's methods in the DefaultServer.
+func Register(rcv interface{}) error { return DefaultServer.Register(rcv) }

@@ -4,6 +4,7 @@
 
 - [x] 服务端与消息编码
 - [x] 支持并发与异步的客户端
+- [x] 服务注册(service register)
 
 ## License
 
