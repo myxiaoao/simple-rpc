@@ -7,6 +7,7 @@
 - [x] 服务注册(service register)
 - [x] 超时处理(timeout)
 - [x] 支持 HTTP 协议
+- [x] 服务发现与注册中心(registry)
 
 ## License
 
